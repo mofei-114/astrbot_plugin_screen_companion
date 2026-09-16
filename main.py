@@ -31,7 +31,10 @@ from .core.proactive import ScreenCompanionProactiveMixin
 from .core.runtime import ScreenCompanionRuntimeMixin
 from .core.memory import ScreenCompanionMemoryMixin
 from .core.media import ScreenCompanionMediaMixin
-from .core.remote_receiver import RemoteScreenReceiver
+from .core.remote_receiver import (
+    RemoteScreenReceiver,
+    RemoteScreenshotError,
+)
 from .core.input_stats import ScreenCompanionInputStatsMixin
 from .core.command_support import ScreenCompanionCommandSupportMixin
 
@@ -576,7 +579,14 @@ class ScreenPeekTool(FunctionTool[AstrAgentContext]):
         question = str(kwargs.get("question", "") or "").strip()
         event = _resolve_tool_event(context)
         try:
-            capture_context = await plugin._capture_recognition_context()
+            # 工具语义是"确认当前屏幕"，因此远程图像模式必须请求新帧；
+            # 本地与共享截图目录保留原有选择行为，不借远程改造改变它们。
+            capture_context = await plugin._capture_recognition_context(
+                force_fresh_capture=(
+                    plugin._get_runtime_flag("remote_mode")
+                    and not plugin._use_screen_recording_mode()
+                )
+            )
             active_window_title = str(capture_context.get("active_window_title", "") or "")
             components = await plugin._analyze_screen(
                 capture_context,
@@ -590,6 +600,10 @@ class ScreenPeekTool(FunctionTool[AstrAgentContext]):
             if result_text:
                 return result_text
             return "这次没有拿到可用的屏幕观察结果，可能当前不在允许识屏的时段，或画面分析没有返回有效文本。"
+        except RemoteScreenshotError as e:
+            # 采集失败时不进入视觉分析，也不写成功识屏记录。
+            logger.warning("LLM 工具 screen_peek 远程采集失败: %s", e.detail or e)
+            return f"窥屏失败：{e.public_message}"
         except Exception as e:
             logger.error("LLM 工具 screen_peek 调用失败: %s", e)
             return f"窥屏失败：{e}"
@@ -1054,6 +1068,10 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
     def _get_runtime_flag(self, name: str, default: bool = False) -> bool:
         return self._coerce_bool(getattr(self, name, default))
 
+    def _get_remote_screenshot_request_timeout(self) -> float:
+        """按需截图的等待预算；始终小于图像外层采集超时。"""
+        return float(self._get_remote_screenshot_timeout())
+
     def _configure_remote_receiver_from_runtime(self) -> None:
         if not self._get_runtime_flag("remote_mode"):
             self._remote_receiver = None
@@ -1061,6 +1079,7 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
         self._remote_receiver = RemoteScreenReceiver(
             port=min(65535, max(1, int(getattr(self, "remote_ws_port", 6315) or 6315))),
             auth_token=str(getattr(self, "remote_auth_token", "") or ""),
+            request_timeout=self._get_remote_screenshot_request_timeout(),
         )
 
     async def _sync_remote_receiver_runtime(self) -> None:
@@ -1070,6 +1089,7 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
             max(1, int(getattr(self, "remote_ws_port", 6315) or 6315)),
         )
         desired_token = str(getattr(self, "remote_auth_token", "") or "")
+        desired_timeout = self._get_remote_screenshot_request_timeout()
         receiver = getattr(self, "_remote_receiver", None)
 
         if not enabled:
@@ -1082,6 +1102,11 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
             receiver
             and int(getattr(receiver, "port", 0) or 0) == desired_port
             and str(getattr(receiver, "auth_token", "") or "") == desired_token
+            and abs(
+                float(getattr(receiver, "request_timeout", 0.0) or 0.0)
+                - desired_timeout
+            )
+            < 1e-6
         ):
             if not receiver.is_running:
                 await receiver.start()
@@ -1093,6 +1118,7 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
         receiver = RemoteScreenReceiver(
             port=desired_port,
             auth_token=desired_token,
+            request_timeout=desired_timeout,
         )
         self._remote_receiver = receiver
         await receiver.start()
@@ -2090,6 +2116,10 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
         except asyncio.TimeoutError:
             logger.error("操作超时，请检查网络连接、模型响应速度或系统资源。")
             yield event.plain_result("操作超时，请稍后重试。")
+        except RemoteScreenshotError as e:
+            # 远程采集有明确原因时直接反馈，不只给通用文案。
+            logger.warning("/kp 远程采集失败: %s", e.detail or e)
+            yield event.plain_result(f"这次没能看到你的屏幕：{e.public_message}")
         except Exception as e:
             logger.error(f"发送消息失败: {e}")
             import traceback
@@ -2262,6 +2292,12 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
                         event.unified_msg_origin, MessageChain([Plain(segment)])
                     )
                     await asyncio.sleep(0.4)
+        except RemoteScreenshotError as e:
+            # 只有已经通过意图、私聊权限和冷却检查后才会走到这里：说明本次请求
+            # 已被消费，需要明确反馈一次错误并终止，避免主回复继续编造画面。
+            logger.warning("自然语言识屏远程采集失败: %s", e.detail or e)
+            event.stop_event()
+            yield event.plain_result(f"这次没能看到你的屏幕：{e.public_message}")
         except Exception as e:
             logger.error(f"自然语言识屏助手失败: {e}")
 
