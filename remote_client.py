@@ -1466,12 +1466,18 @@ class RemoteClientSession:
                     continue
                 self._job_busy = True
                 try:
+                    # 与本地录屏语义对齐：录制前先取一次活动窗口标题。
+                    # 录完再取会把「录制期间切到的窗口」配给这段视频，
+                    # 而视频内容其实是切换前那段画面。
+                    title_before = await asyncio.to_thread(
+                        get_active_window_title
+                    )
                     video_bytes = await asyncio.to_thread(
                         capture_video,
                         self._config.video_duration,
                         self._config.ffmpeg_path,
                     )
-                    await self._send_video(video_bytes)
+                    await self._send_video(video_bytes, title_before=title_before)
                 finally:
                     self._job_busy = False
             except asyncio.CancelledError:
@@ -1483,17 +1489,32 @@ class RemoteClientSession:
             except Exception as e:
                 log.error("周期录屏失败: %s", e)
 
-    async def _send_video(self, video_bytes: bytes) -> None:
-        """按既有协议分块上传一段视频；确认只由统一 reader 读取。"""
+    async def _send_video(self, video_bytes: bytes, *, title_before: str = "") -> None:
+        """按既有协议分块上传一段视频；确认只由统一 reader 读取。
+
+        ``title_before`` 是录制开始前取得的窗口标题，与本地录屏语义一致：
+        本地也是在开录前取一次活动窗口标题，因为录到的画面属于那一段。
+        录制结束后再查一次仅用于诊断——若标题已变化，说明录制期间切换过
+        窗口，此时仍沿用录制前的标题，不把之后切到的窗口配给这段视频。
+        录制前取不到标题时退回录制后的结果；两者都取不到则为空标题。
+        """
         upload_id = uuid.uuid4().hex
         chunk_size = 5 * 1024 * 1024
+        title_after = await asyncio.to_thread(get_active_window_title)
+        if title_before and title_after and title_before != title_after:
+            log.debug(
+                "录制期间活动窗口发生变化（%s -> %s），沿用录制前标题",
+                title_before,
+                title_after,
+            )
+        window_title = title_before or title_after
         await self._exchange(
             {
                 "type": "video_meta",
                 "upload_id": upload_id,
                 "total_size": len(video_bytes),
                 "mime_type": "video/mp4",
-                "window_title": get_active_window_title(),
+                "window_title": window_title,
                 "client_id": self._config.client_id,
                 "duration_seconds": max(0, int(self._config.video_duration or 0)),
                 "timestamp": time.time(),

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import threading
 import time
@@ -1463,6 +1464,75 @@ class ClientActiveWindowSessionTests(_BaseClientTest):
 
 def pytest_fail_region():
     raise AssertionError("未提供可用矩形时不应走裁剪路径")
+
+
+class ClientVideoTitlePairingTests(unittest.IsolatedAsyncioTestCase):
+    """录屏窗口标题与本地语义对齐：以录制前的活动窗口为准。"""
+
+    async def _run_send_video(self, *, title_before: str, titles_after: list[str]) -> dict:
+        """驱动一次 _send_video，返回上传的 video_meta。"""
+        socket = FakeServerSocket()
+        session = RemoteClientSession(
+            socket, _make_config(), server_handshake=socket.handshake
+        )
+        session_task = asyncio.ensure_future(session.run())
+        remaining = list(titles_after)
+
+        def fake_title() -> str:
+            return remaining.pop(0) if remaining else ""
+
+        try:
+            await _wait_for(
+                lambda: "client_capabilities" in socket.types(), timeout=3.0
+            )
+            await socket.push({"status": "capabilities_received"})
+            await _wait_for(lambda: session.negotiated, timeout=3.0)
+
+            with patch.object(remote_client, "get_active_window_title", fake_title):
+                video_task = asyncio.ensure_future(
+                    session._send_video(b"video", title_before=title_before)
+                )
+                await _wait_for(lambda: socket.of_type("video_meta"), timeout=3.0)
+                meta = socket.of_type("video_meta")[0]
+                upload_id = meta["upload_id"]
+
+                await socket.push({"status": "video_ready", "upload_id": upload_id})
+                await _wait_for(lambda: socket.of_type("video_chunk"), timeout=3.0)
+                await socket.push({
+                    "status": "video_chunk_received",
+                    "upload_id": upload_id,
+                    "index": 0,
+                })
+                await _wait_for(lambda: socket.of_type("video_complete"), timeout=3.0)
+                await socket.push({"status": "video_complete", "upload_id": upload_id})
+                await asyncio.wait_for(video_task, timeout=3.0)
+            return meta
+        finally:
+            await session._close_session()
+            session_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await session_task
+
+    async def test_title_before_recording_wins_when_window_changed(self) -> None:
+        """录制期间切窗口时，不把之后切到的窗口配给这段视频。"""
+        meta = await self._run_send_video(
+            title_before="Editor", titles_after=["Browser"]
+        )
+
+        self.assertEqual("Editor", meta.get("window_title"))
+
+    async def test_unchanged_title_is_reused(self) -> None:
+        meta = await self._run_send_video(
+            title_before="Editor", titles_after=["Editor"]
+        )
+
+        self.assertEqual("Editor", meta.get("window_title"))
+
+    async def test_falls_back_to_after_title_when_before_is_empty(self) -> None:
+        """录制前取不到标题时，退回录制后的结果，而不是发送空标题。"""
+        meta = await self._run_send_video(title_before="", titles_after=["Editor"])
+
+        self.assertEqual("Editor", meta.get("window_title"))
 
 
 class ClientNegotiationTests(_BaseClientTest):
