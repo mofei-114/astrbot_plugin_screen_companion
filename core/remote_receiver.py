@@ -47,6 +47,8 @@ except ImportError:
 PROTOCOL_VERSION = 2
 #: 客户端能力名称：支持在收到请求后重新采集截图。
 CAPABILITY_REQUEST_SCREENSHOT = "request_screenshot"
+#: 客户端能力名称：支持把截图裁剪到活动窗口。
+CAPABILITY_CAPTURE_ACTIVE_WINDOW = "capture_active_window"
 #: 单次按需截图的默认等待预算（秒）。必须小于图像外层 20 秒采集超时。
 DEFAULT_REQUEST_TIMEOUT = 10.0
 #: 控制消息（无需 ACK 的回复）发送预算（秒）。
@@ -170,9 +172,12 @@ class RemoteScreenReceiver:
         port: int = 6315,
         auth_token: str = "",
         request_timeout: float = DEFAULT_REQUEST_TIMEOUT,
+        capture_active_window: bool = False,
     ):
         self.port = min(65535, max(1, int(port or 6315)))
         self.auth_token = str(auth_token or "").strip()
+        #: 插件端「只截取活动窗口」配置；远程模式下由支持的客户端执行裁剪。
+        self.capture_active_window = bool(capture_active_window)
         try:
             resolved_timeout = float(request_timeout)
         except (TypeError, ValueError):
@@ -247,6 +252,17 @@ class RemoteScreenReceiver:
         if self._stopping:
             return False
         return len(self._live_clients(capable_only=True)) > 0
+
+    @property
+    def has_active_window_capable_client(self) -> bool:
+        """是否存在声明了活动窗口裁剪能力的已认证连接。"""
+        if self._stopping:
+            return False
+        return any(
+            CAPABILITY_CAPTURE_ACTIVE_WINDOW
+            in (self._client_capabilities.get(websocket) or set())
+            for websocket in self._live_clients(capable_only=True)
+        )
 
     @property
     def has_authenticated_client(self) -> bool:
@@ -608,10 +624,7 @@ class RemoteScreenReceiver:
         async def send_request() -> None:
             if loop.time() >= deadline:
                 raise asyncio.TimeoutError()
-            await websocket.send(json.dumps({
-                "type": "request_screenshot",
-                "request_id": request_id,
-            }))
+            await websocket.send(json.dumps(self._build_request_command(request_id, websocket)))
 
         send_task = asyncio.ensure_future(send_request())
         try:
@@ -647,6 +660,28 @@ class RemoteScreenReceiver:
             self._pending_requests.pop(request_id, None)
             self._finish_request_future(future)
             self._reap_send_task(websocket, send_task)
+
+    def _build_request_command(self, request_id: str, websocket) -> dict[str, Any]:
+        """构造截图命令。
+
+        只有目标客户端声明了对应能力时才下发范围要求；否则客户端会忽略未知
+        字段并继续全屏，服务端据此在日志里如实记录降级原因。
+        """
+        command: dict[str, Any] = {
+            "type": "request_screenshot",
+            "request_id": request_id,
+        }
+        if not self.capture_active_window:
+            return command
+        capabilities = self._client_capabilities.get(websocket) or set()
+        if CAPABILITY_CAPTURE_ACTIVE_WINDOW in capabilities:
+            command["capture_active_window"] = True
+        else:
+            logger.debug(
+                "客户端未声明 %s 能力，本次仍请求整屏截图",
+                CAPABILITY_CAPTURE_ACTIVE_WINDOW,
+            )
+        return command
 
     def _resolve_future_result(self, future) -> tuple[bytes, str, dict[str, Any]]:
         """取出等待者结果并把异常统一为 ``RemoteScreenshotError``。"""
@@ -851,6 +886,10 @@ class RemoteScreenReceiver:
         await websocket.send(json.dumps({
             "status": "capabilities_received",
             "protocol_version": PROTOCOL_VERSION,
+            # 会话级默认：显式周期推送没有逐次请求可用，客户端据此决定截图范围。
+            "options": {
+                "capture_active_window": bool(self.capture_active_window),
+            },
         }))
         logger.info(
             "远程客户端能力已登记: capabilities=%s client_id=%s",
@@ -906,6 +945,8 @@ class RemoteScreenReceiver:
                 "system_stats": data.get("system_stats", {}),
                 "timestamp": data.get("timestamp", time.time()),
                 "client_id": data.get("client_id", ""),
+                # 客户端如实上报的实际截图范围：window / fullscreen。
+                "capture_scope": str(data.get("capture_scope", "") or ""),
                 "protocol_version": PROTOCOL_VERSION if is_v2_client else 1,
             }
             if request_id:
@@ -1032,6 +1073,7 @@ class RemoteScreenReceiver:
                 "system_stats": data.get("system_stats", {}),
                 "timestamp": data.get("timestamp", time.time()),
                 "client_id": data.get("client_id", ""),
+                "capture_scope": str(data.get("capture_scope", "") or ""),
                 "protocol_version": PROTOCOL_VERSION if is_v2_client else 1,
             }
             if request_id:

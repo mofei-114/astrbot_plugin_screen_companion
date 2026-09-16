@@ -214,7 +214,7 @@
   "capture_active_window": {
     "description": "只截取活动窗口",
     "type": "bool",
-    "hint": "截图模式下只截当前窗口，不截全屏。",
+    "hint": "截图模式下只截当前窗口，不截全屏。远程模式下由客户端执行裁剪：需要客户端升级到支持该能力并声明能力；窗口最小化、平台不支持或几何查询失败时会回退为全屏，并在日志中记录一次提示。",
     "default": false,
     "condition": {
       "enabled": true,

@@ -3451,6 +3451,27 @@ class ScreenCompanionMediaMixin:
             budget = min(budget, max(1.0, outer - 5.0))
         return float(max(1.0, budget))
 
+    def _warn_if_window_crop_missed(self, meta: dict[str, Any] | None) -> None:
+        """插件要求只截活动窗口、但客户端实际返回全屏时如实记录一次。
+
+        远程模式下裁剪由客户端执行；旧客户端、平台不支持或窗口矩形不可用时
+        会回退全屏。这属于降级而不是失败，但必须留下可排查的记录，避免用户
+        以为开关已经生效。为避免刷屏，同一小时内只提示一次。
+        """
+        if not getattr(self, "capture_active_window", False):
+            return
+        if str((meta or {}).get("capture_scope", "") or "") == "window":
+            return
+        now = time.time()
+        last = float(getattr(self, "_window_crop_warned_at", 0.0) or 0.0)
+        if now - last < 3600.0:
+            return
+        self._window_crop_warned_at = now
+        logger.warning(
+            "远程客户端本次返回的是全屏截图，未按「只截取活动窗口」裁剪。"
+            "请确认客户端已升级、窗口未最小化，且系统支持活动窗口几何查询。"
+        )
+
     async def _capture_screen_bytes(self, *, force_fresh_capture: bool = False):
         """返回截图字节流与来源标签。
 
@@ -3473,9 +3494,10 @@ class ScreenCompanionMediaMixin:
 
             if receiver.has_request_capable_client:
                 # 新版客户端：只要识屏需要画面，就请求一张本次采集的新图。
-                image_bytes, window_title, _meta = await receiver.request_screenshot(
+                image_bytes, window_title, meta = await receiver.request_screenshot(
                     timeout=self._get_remote_screenshot_timeout()
                 )
+                self._warn_if_window_crop_missed(meta)
                 return image_bytes, window_title or "远程客户端截图"
 
             if force_fresh_capture:

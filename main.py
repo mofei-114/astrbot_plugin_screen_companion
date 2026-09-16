@@ -1080,6 +1080,7 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
             port=min(65535, max(1, int(getattr(self, "remote_ws_port", 6315) or 6315))),
             auth_token=str(getattr(self, "remote_auth_token", "") or ""),
             request_timeout=self._get_remote_screenshot_request_timeout(),
+            capture_active_window=self._get_runtime_flag("capture_active_window"),
         )
 
     async def _sync_remote_receiver_runtime(self) -> None:
@@ -1090,6 +1091,7 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
         )
         desired_token = str(getattr(self, "remote_auth_token", "") or "")
         desired_timeout = self._get_remote_screenshot_request_timeout()
+        desired_active_window = self._get_runtime_flag("capture_active_window")
         receiver = getattr(self, "_remote_receiver", None)
 
         if not enabled:
@@ -1107,6 +1109,8 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
                 - desired_timeout
             )
             < 1e-6
+            and bool(getattr(receiver, "capture_active_window", False))
+            == desired_active_window
         ):
             if not receiver.is_running:
                 await receiver.start()
@@ -1119,6 +1123,7 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
             port=desired_port,
             auth_token=desired_token,
             request_timeout=desired_timeout,
+            capture_active_window=desired_active_window,
         )
         self._remote_receiver = receiver
         await receiver.start()
