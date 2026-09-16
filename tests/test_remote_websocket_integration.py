@@ -31,9 +31,14 @@ AUTH_TOKEN = "integration-token"
 class _ReceiverHarness:
     """在随机端口启动真实的接收器服务，并把 server 登记给接收器。"""
 
-    def __init__(self, *, request_timeout: float = 5.0) -> None:
+    def __init__(
+        self,
+        *,
+        request_timeout: float = 5.0,
+        auth_token: str = AUTH_TOKEN,
+    ) -> None:
         self.receiver = RemoteScreenReceiver(
-            auth_token=AUTH_TOKEN, request_timeout=request_timeout
+            auth_token=auth_token, request_timeout=request_timeout
         )
         self.server = None
         self.port = 0
@@ -375,6 +380,19 @@ class RemoteWebSocketIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await _upload_frame(websocket, request_id=next_command["request_id"])
         image, _title, _meta = await asyncio.wait_for(next_task, timeout=5.0)
         self.assertEqual(JPEG, image)
+
+    async def test_i09_configured_client_token_is_accepted_by_no_auth_server(
+        self,
+    ) -> None:
+        harness = await _ReceiverHarness(auth_token="").start()
+        self.harness.receiver._server = None
+        self.harness = harness
+
+        websocket, handshake = await self._connect(token="configured-but-not-required")
+        self.assertEqual("ready", handshake.get("status"))
+        negotiated = await _negotiate(websocket)
+        self.assertEqual("capabilities_received", negotiated.get("status"))
+        self.assertTrue(harness.receiver.has_request_capable_client)
 
     async def test_tcp_port_is_bound_to_loopback_only(self) -> None:
         host = self.harness.server.sockets[0].getsockname()[0]

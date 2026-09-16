@@ -681,6 +681,14 @@ class RemoteClientSession:
         status = str(data.get("status", "") or "")
         if status != waiter.expected_status:
             return False
+        if waiter.upload_id:
+            ack_upload_id = str(data.get("upload_id", "") or "")
+            if waiter.kind == "video_chunk":
+                # v2 服务端会回显 upload_id；旧服务端只回显 index，继续兼容。
+                if ack_upload_id and ack_upload_id != waiter.upload_id:
+                    return False
+            elif ack_upload_id != waiter.upload_id:
+                return False
         if waiter.kind == "video_chunk":
             try:
                 return int(data.get("index", -1)) == int(waiter.index or 0)
@@ -778,9 +786,19 @@ class RemoteClientSession:
         )
         # 必须先登记再发送：服务端可能在 send() 返回前就回 ACK。
         self._ack_waiter = waiter
+        deadline = loop.time() + float(timeout)
         try:
-            await self._send_message(payload, timeout=min(timeout, self._config.ack_timeout))
-            return await asyncio.wait_for(waiter.future, timeout=timeout)
+            await self._send_message(
+                payload,
+                timeout=min(
+                    max(0.0, deadline - loop.time()),
+                    self._config.ack_timeout,
+                ),
+            )
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                raise asyncio.TimeoutError()
+            return await asyncio.wait_for(waiter.future, timeout=remaining)
         except asyncio.TimeoutError as exc:
             raise _ProtocolError(
                 f"等待 {expected_status} 超时，结束会话以避免旧 ACK 错配"
@@ -874,7 +892,11 @@ class RemoteClientSession:
             if _remaining_seconds(deadline) <= 0:
                 raise _CaptureBudgetExceededError("采集完成时预算已耗尽")
             await self._send_screenshot_payload(
-                jpeg_bytes, title, meta, request_id=request_id
+                jpeg_bytes,
+                title,
+                meta,
+                request_id=request_id,
+                deadline=deadline,
             )
         except asyncio.CancelledError:
             raise
@@ -943,6 +965,7 @@ class RemoteClientSession:
         meta: dict[str, Any],
         *,
         request_id: str = "",
+        deadline: float | None = None,
     ) -> None:
         """完成一次完整的图像上传事务。"""
         payload_base: dict[str, Any] = {
@@ -954,18 +977,28 @@ class RemoteClientSession:
         if request_id:
             payload_base["request_id"] = request_id
 
+        def exchange_timeout() -> float | None:
+            if deadline is None:
+                return None
+            remaining = _remaining_seconds(deadline)
+            if remaining <= 0:
+                raise _CaptureBudgetExceededError("截图上传时预算已耗尽")
+            return min(float(self._config.ack_timeout), remaining)
+
         if self._config.binary:
             await self._exchange(
                 {"type": "screenshot_meta", **payload_base},
                 expected_status="meta_received",
                 kind="screenshot_meta",
                 request_id=request_id,
+                timeout=exchange_timeout(),
             )
             await self._exchange(
                 jpeg_bytes,
                 expected_status="binary_screenshot_received",
                 kind="screenshot_binary",
                 request_id=request_id,
+                timeout=exchange_timeout(),
             )
         else:
             await self._exchange(
@@ -977,6 +1010,7 @@ class RemoteClientSession:
                 expected_status="screenshot_received",
                 kind="screenshot_bundle",
                 request_id=request_id,
+                timeout=exchange_timeout(),
             )
 
     # ------------------------------------------------------------------
