@@ -2497,22 +2497,34 @@ class ScreenCompanionMediaMixin:
 
                 # 检测系统负载
                 system_high_load = False
-                try:
-                    import psutil
+                if self._get_runtime_flag("remote_mode"):
+                    # 远程模式下"用户设备负载"只能来自客户端随帧上报的统计；
+                    # 服务器负载与用户电脑无关，不能用来决定是否触发识屏。
+                    # 按需路径默认不采样统计，因此这里通常没有数据、不触发高负载分支。
+                    remote_status = self._get_remote_system_status_prompt()
+                    if remote_status is not None:
+                        _remote_prompt, system_high_load = remote_status
+                        if system_high_load:
+                            logger.info(
+                                f"[任务 {task_id}] 客户端上报系统负载较高，将触发一次识屏"
+                            )
+                else:
+                    try:
+                        import psutil
 
-                    cpu_percent = psutil.cpu_percent(interval=1)
-                    memory = psutil.virtual_memory()
-                    memory_percent = memory.percent
+                        cpu_percent = psutil.cpu_percent(interval=1)
+                        memory = psutil.virtual_memory()
+                        memory_percent = memory.percent
 
-                    if cpu_percent > 80 or memory_percent > 80:
-                        system_high_load = True
-                        logger.info(
-                            f"[任务 {task_id}] 系统资源占用较高: CPU={cpu_percent}%, 内存={memory_percent}%"
-                        )
-                except ImportError:
-                    logger.debug(f"[任务 {task_id}] 未安装 psutil，跳过系统负载检测")
-                except Exception as e:
-                    logger.debug(f"[任务 {task_id}] 系统状态检测失败: {e}")
+                        if cpu_percent > 80 or memory_percent > 80:
+                            system_high_load = True
+                            logger.info(
+                                f"[任务 {task_id}] 系统资源占用较高: CPU={cpu_percent}%, 内存={memory_percent}%"
+                            )
+                    except ImportError:
+                        logger.debug(f"[任务 {task_id}] 未安装 psutil，跳过系统负载检测")
+                    except Exception as e:
+                        logger.debug(f"[任务 {task_id}] 系统状态检测失败: {e}")
 
                 # 高负载时强制触发一次识屏
                 change_snapshot = self._build_auto_screen_change_snapshot(

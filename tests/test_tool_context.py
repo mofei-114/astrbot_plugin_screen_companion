@@ -977,5 +977,37 @@ class RemoteRecordingEntryTests(unittest.IsolatedAsyncioTestCase):
         plugin._run_screen_assist.assert_awaited_once()
 
 
+class RemoteAutoScreenLoadSourceTests(unittest.TestCase):
+    """自动观察的高负载判定在远程模式下必须用客户端统计，而不是服务器负载。"""
+
+    def test_remote_high_load_comes_from_client_stats(self) -> None:
+        plugin = _make_remote_media_plugin(
+            _FakeRemoteReceiver(system_stats={"cpu_percent": 96, "memory_percent": 40})
+        )
+
+        with patch("psutil.cpu_percent") as cpu_mock:
+            result = plugin._get_remote_system_status_prompt()
+
+        self.assertIsNotNone(result)
+        _prompt, high_load = result
+        self.assertTrue(high_load)
+        cpu_mock.assert_not_called()
+
+    def test_remote_without_stats_reports_no_high_load(self) -> None:
+        """没有客户端统计时必须返回 None，让调用方不触发高负载分支。"""
+        plugin = _make_remote_media_plugin(_FakeRemoteReceiver(system_stats={}))
+
+        with patch("psutil.cpu_percent") as cpu_mock:
+            result = plugin._get_remote_system_status_prompt()
+
+        self.assertIsNone(result)
+        cpu_mock.assert_not_called()
+
+    def test_remote_without_receiver_reports_no_high_load(self) -> None:
+        plugin = _make_remote_media_plugin(None)
+
+        self.assertIsNone(plugin._get_remote_system_status_prompt())
+
+
 if __name__ == "__main__":
     unittest.main()
