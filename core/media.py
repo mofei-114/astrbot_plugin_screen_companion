@@ -21,6 +21,10 @@ from astrbot.api.message_components import BaseMessageComponent, Image, Plain
 
 from ..web_server import WebServer
 from .app_descriptions import describe_window_activity, infer_scene_from_window_title
+from .remote_receiver import (
+    DEFAULT_REQUEST_TIMEOUT,
+    make_screenshot_error,
+)
 
 class ScreenCompanionMediaMixin:
     def _guess_screen_material_extension(
@@ -3432,30 +3436,75 @@ class ScreenCompanionMediaMixin:
 
         return temp_file.name
 
+    def _get_remote_screenshot_timeout(self) -> float:
+        """按需截图等待预算。
+
+        必须小于图像外层 20 秒采集超时，留出错误传播与用户提示的时间；
+        因此默认 10 秒，并在外层超时较小时继续收紧。
+        """
+        budget = DEFAULT_REQUEST_TIMEOUT
+        try:
+            outer = float(self._get_capture_context_timeout("image"))
+        except Exception:
+            outer = 20.0
+        if outer > 1.0:
+            budget = min(budget, max(1.0, outer - 5.0))
+        return float(max(1.0, budget))
+
     async def _capture_screen_bytes(self, *, force_fresh_capture: bool = False):
-        """返回截图字节流与来源标签。"""
+        """返回截图字节流与来源标签。
+
+        remote_mode 下的路径选择规则：
+
+        1. 客户端支持按需截图：无论是否强制，都请求一张收到请求后重新采集的新图。
+        2. 客户端不支持按需截图且本次要求强制重拍：明确提示升级客户端。
+        3. 客户端不支持按需截图且本次允许缓存：沿用旧缓存及最大时效检查。
+        4. 按需请求已经发出但失败：直接反馈失败，绝不回退缓存冒充成功。
+        """
 
         if self._get_runtime_flag("remote_mode"):
             receiver = getattr(self, "_remote_receiver", None)
             if receiver is None:
                 raise RuntimeError("远程模式已开启但接收服务未初始化")
-            if not receiver.has_screenshot:
-                raise RuntimeError(
-                    "远程模式已开启但无可用截图，请确认客户端已连接并推送截图"
-                )
-            age = receiver.latest_age_seconds
             max_age = max(
                 5,
                 int(getattr(self, "remote_screenshot_max_age", 60) or 60),
             )
-            if age > max_age:
-                raise RuntimeError(
-                    f"远程截图已过期（{int(age)} 秒前），客户端可能已断开，请检查连接"
+
+            if receiver.has_request_capable_client:
+                # 新版客户端：只要识屏需要画面，就请求一张本次采集的新图。
+                image_bytes, window_title, _meta = await receiver.request_screenshot(
+                    timeout=self._get_remote_screenshot_timeout()
                 )
-            image_bytes, window_title, _meta = await receiver.get_latest_screenshot()
-            if image_bytes:
                 return image_bytes, window_title or "远程客户端截图"
-            raise RuntimeError("远程客户端已连接但尚未推送截图")
+
+            if force_fresh_capture:
+                if not receiver.has_authenticated_client:
+                    raise make_screenshot_error(
+                        "no_client",
+                        detail="当前没有已认证的远程客户端，无法完成强制重拍",
+                    )
+                raise make_screenshot_error(
+                    "unsupported_client",
+                    detail="客户端未声明按需截图能力，无法完成强制重拍",
+                )
+
+            # 旧客户端兼容路径：允许使用缓存，但必须通过最大时效检查。
+            image_bytes, window_title, meta = await receiver.get_latest_screenshot(
+                max_age=max_age
+            )
+            if int(meta.get("protocol_version", 1) or 1) != 1:
+                # 新版客户端断开后，不能把它之前的按需帧当成旧客户端兼容缓存。
+                raise make_screenshot_error(
+                    "no_client",
+                    detail="最近一帧来自按需协议客户端，当前没有可用的兼容缓存",
+                )
+            if not image_bytes:
+                raise make_screenshot_error(
+                    "no_client",
+                    detail="远程客户端已连接但尚未推送可用截图",
+                )
+            return image_bytes, window_title or "远程客户端截图"
 
         def _core_task():
             import os
@@ -3649,22 +3698,19 @@ class ScreenCompanionMediaMixin:
             )
             if receiver.latest_video_age_seconds > max_age:
                 raise RuntimeError("远程录屏已过期，请确认客户端仍在推送录屏")
-            latest_image_bytes, latest_window_title, _ = (
-                await receiver.get_latest_screenshot()
-            )
-            window_title = str(
-                video_meta.get("window_title", "")
-                or latest_window_title
-                or "远程客户端录屏"
-            )
+            # 远程录屏不携带本次采集的实时锚点图：默认按需截图后缓存不再持续
+            # 刷新，把任意缓存图当作"现在"的画面会让模型误判当前状态。
+            # 窗口标题只取视频自身元数据，没有则使用通用远程录屏标签。
+            video_window_title = str(video_meta.get("window_title", "") or "")
+            window_title = video_window_title or "远程客户端录屏"
             return {
                 "media_kind": "video",
                 "mime_type": str(video_meta.get("mime_type", "video/mp4") or "video/mp4"),
                 "media_bytes": video_bytes,
                 "active_window_title": window_title,
-                "clip_active_window_title": window_title,
-                "latest_window_title": latest_window_title or window_title,
-                "latest_image_bytes": latest_image_bytes,
+                "clip_active_window_title": video_window_title or window_title,
+                "latest_window_title": video_window_title or window_title,
+                "latest_image_bytes": b"",
                 "duration_seconds": video_meta.get("duration_seconds", 0),
                 "source_label": window_title,
             }

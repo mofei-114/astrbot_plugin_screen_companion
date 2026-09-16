@@ -4,9 +4,12 @@ from __future__ import annotations
 import datetime
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
+
+from astrbot.api.message_components import Plain
 
 from astrbot_plugin_screen_companion import main
+from astrbot_plugin_screen_companion.core.remote_receiver import RemoteScreenshotError
 
 
 class ToolContextTests(unittest.IsolatedAsyncioTestCase):
@@ -92,6 +95,274 @@ class ToolContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(main._screen_companion_current_tool_event.get())
         finally:
             main._screen_companion_current_tool_event.reset(token)
+
+
+class ScreenPeekRemoteCaptureTests(unittest.IsolatedAsyncioTestCase):
+    """screen_peek 仅在远程图像模式要求新帧，并把远程错误呈现为工具失败。"""
+
+    def _make_plugin(self, *, remote_mode: bool, recording: bool, result=None, error=None):
+        plugin = SimpleNamespace(
+            remote_mode=remote_mode,
+            screen_recognition_mode=recording,
+            _get_runtime_flag=lambda name, default=False: bool(
+                getattr(SimpleNamespace(remote_mode=remote_mode), name, default)
+            ),
+            _use_screen_recording_mode=lambda: recording,
+        )
+        calls: list = []
+
+        async def capture_recognition_context(**kwargs):
+            calls.append(kwargs)
+            if error is not None:
+                raise error
+            return {
+                "media_kind": "image",
+                "media_bytes": b"\xff\xd8x\xff\xd9",
+                "active_window_title": "Editor",
+            }
+
+        plugin._capture_recognition_context = capture_recognition_context
+        plugin._analyze_screen = AsyncMock(
+            return_value=[Plain("看到了编辑器")] if result is None else result
+        )
+        return plugin, calls
+
+    async def test_remote_image_mode_requests_fresh_frame(self) -> None:
+        plugin, calls = self._make_plugin(remote_mode=True, recording=False)
+        wrapper = SimpleNamespace(context=SimpleNamespace(event=object()))
+
+        with (
+            patch.object(main, "_screen_companion_tool_plugin", plugin),
+            patch.object(
+                main, "_ensure_tool_admin_permission", AsyncMock(return_value=(True, ""))
+            ),
+        ):
+            result = await main.ScreenPeekTool().call(wrapper, question="看看")
+
+        self.assertEqual("看到了编辑器", result)
+        self.assertEqual([{"force_fresh_capture": True}], calls)
+        plugin._analyze_screen.assert_awaited_once()
+
+    async def test_local_mode_keeps_default_capture_parameters(self) -> None:
+        plugin, calls = self._make_plugin(remote_mode=False, recording=False)
+        wrapper = SimpleNamespace(context=SimpleNamespace(event=object()))
+
+        with (
+            patch.object(main, "_screen_companion_tool_plugin", plugin),
+            patch.object(
+                main, "_ensure_tool_admin_permission", AsyncMock(return_value=(True, ""))
+            ),
+        ):
+            await main.ScreenPeekTool().call(wrapper)
+
+        # 本地/共享目录模式保留原默认，不借远程改造改变本地选择。
+        self.assertEqual([{"force_fresh_capture": False}], calls)
+
+    async def test_remote_recording_mode_does_not_force_fresh_image(self) -> None:
+        plugin, calls = self._make_plugin(remote_mode=True, recording=True)
+        wrapper = SimpleNamespace(context=SimpleNamespace(event=object()))
+
+        with (
+            patch.object(main, "_screen_companion_tool_plugin", plugin),
+            patch.object(
+                main, "_ensure_tool_admin_permission", AsyncMock(return_value=(True, ""))
+            ),
+        ):
+            await main.ScreenPeekTool().call(wrapper)
+
+        self.assertEqual([{"force_fresh_capture": False}], calls)
+
+    async def test_remote_capture_error_is_surfaced_without_vision_call(self) -> None:
+        error = RemoteScreenshotError(
+            "timeout", "远程截图超时，请检查网络或客户端截图权限。"
+        )
+        plugin, _calls = self._make_plugin(
+            remote_mode=True, recording=False, error=error
+        )
+        wrapper = SimpleNamespace(context=SimpleNamespace(event=object()))
+
+        with (
+            patch.object(main, "_screen_companion_tool_plugin", plugin),
+            patch.object(
+                main, "_ensure_tool_admin_permission", AsyncMock(return_value=(True, ""))
+            ),
+        ):
+            result = await main.ScreenPeekTool().call(wrapper)
+
+        self.assertIn(error.public_message, result)
+        # 采集失败不进入视觉分析。
+        plugin._analyze_screen.assert_not_called()
+
+    async def test_denied_permission_never_requests_capture(self) -> None:
+        plugin, calls = self._make_plugin(remote_mode=True, recording=False)
+        wrapper = SimpleNamespace(context=SimpleNamespace(event=None))
+
+        with (
+            patch.object(main, "_screen_companion_tool_plugin", plugin),
+            patch.object(
+                main,
+                "_ensure_tool_admin_permission",
+                AsyncMock(return_value=(False, "denied")),
+            ),
+        ):
+            result = await main.ScreenPeekTool().call(wrapper)
+
+        self.assertEqual("denied", result)
+        self.assertEqual([], calls)
+        plugin._analyze_screen.assert_not_called()
+
+    async def test_missing_tool_context_never_requests_capture(self) -> None:
+        plugin, calls = self._make_plugin(remote_mode=True, recording=False)
+        wrapper = SimpleNamespace()
+        token = main._screen_companion_current_tool_event.set(None)
+        try:
+            with patch.object(main, "_screen_companion_tool_plugin", plugin):
+                result = await main.ScreenPeekTool().call(wrapper)
+        finally:
+            main._screen_companion_current_tool_event.reset(token)
+
+        self.assertIn("权限不足", result)
+        self.assertEqual([], calls)
+
+    async def test_work_collaboration_context_never_captures(self) -> None:
+        plugin = ScreenCompanionRemoteEntryTests._make_work_plugin()
+        # 只读缓存接口不得依赖任何采集入口：没有该属性本身即是约束。
+        self.assertFalse(hasattr(plugin, "_capture_recognition_context"))
+        api = main.ScreenCompanionExtensionAPI(plugin)
+
+        result = await api.get_work_collaboration_context(user_id="10001")
+
+        self.assertTrue(result["available"])
+        plugin._analyze_screen.assert_not_called()
+
+
+class ScreenCompanionRemoteEntryTests(unittest.IsolatedAsyncioTestCase):
+    """自然语言与 /kp 入口的远程错误呈现。"""
+
+    @staticmethod
+    def _make_work_plugin() -> SimpleNamespace:
+        now = datetime.datetime.now().timestamp()
+        return SimpleNamespace(
+            mask_activity_window_titles=False,
+            enable_background_activity_tracking=True,
+            is_running=False,
+            auto_tasks={},
+            _get_active_window_info=lambda: ("Editor", None),
+            _identify_scene=lambda _window: "编程",
+            _build_current_activity_snapshot=lambda: {
+                "type": "工作",
+                "scene": "编程",
+                "window": "Editor",
+                "app_name": "Editor",
+                "resource_label": "Editor",
+                "duration": 60,
+                "end_time": now,
+            },
+            _build_activity_record_meta=lambda **kwargs: dict(kwargs),
+            _get_recent_screen_analysis_traces=lambda limit=8: [],
+            _analyze_screen=AsyncMock(),
+        )
+
+    async def test_natural_language_failure_reports_once_and_stops_event(self) -> None:
+        error = RemoteScreenshotError(
+            "no_client", "远程客户端未连接，请启动客户端后重试。"
+        )
+        captured_replies: list = []
+        stop_calls: list = []
+
+        class FakeEvent:
+            message_str = "帮我看看屏幕上写了什么"
+            unified_msg_origin = "napcat:FriendMessage:10001"
+
+            def stop_event(self) -> None:
+                stop_calls.append(True)
+
+            def plain_result(self, text):
+                captured_replies.append(text)
+                return text
+
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.enable_natural_language_screen_assist = True
+        plugin.debug = False
+        plugin._screen_assist_cooldowns = {}
+        plugin._allow_implicit_screen_skill_trigger = lambda event, text: False
+        plugin._extract_screen_assist_prompt = lambda text, allow_implicit: text
+        plugin._is_private_message_event = lambda event: True
+        plugin._ensure_admin_permission = AsyncMock(return_value=True)
+        plugin._invoke_screen_skill = AsyncMock(side_effect=error)
+        plugin._split_message = lambda text: [text]
+
+        event = FakeEvent()
+        results = [
+            item
+            async for item in plugin.on_natural_language_screen_assist(event)
+        ]
+
+        self.assertEqual(1, len(results))
+        self.assertIn(error.public_message, results[0])
+        self.assertEqual([True], stop_calls)
+        # 失败时冷却已消费，但不应产生成功轨迹记录。
+        plugin._invoke_screen_skill.assert_awaited_once()
+
+    async def test_natural_language_not_triggered_never_captures(self) -> None:
+        class FakeEvent:
+            message_str = "今天天气不错"
+            unified_msg_origin = "napcat:FriendMessage:10001"
+
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.enable_natural_language_screen_assist = True
+        plugin.debug = False
+        plugin._allow_implicit_screen_skill_trigger = lambda event, text: False
+        plugin._extract_screen_assist_prompt = lambda text, allow_implicit: ""
+        plugin._invoke_screen_skill = AsyncMock()
+
+        results = [
+            item
+            async for item in plugin.on_natural_language_screen_assist(FakeEvent())
+        ]
+
+        self.assertEqual([], results)
+        plugin._invoke_screen_skill.assert_not_called()
+
+    async def test_natural_language_disabled_never_captures(self) -> None:
+        class FakeEvent:
+            message_str = "帮我看看屏幕"
+            unified_msg_origin = "napcat:FriendMessage:10001"
+
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.enable_natural_language_screen_assist = False
+        plugin._invoke_screen_skill = AsyncMock()
+
+        results = [
+            item
+            async for item in plugin.on_natural_language_screen_assist(FakeEvent())
+        ]
+
+        self.assertEqual([], results)
+        plugin._invoke_screen_skill.assert_not_called()
+
+    async def test_group_message_never_captures(self) -> None:
+        class FakeEvent:
+            message_str = "帮我看看屏幕上写了什么"
+            unified_msg_origin = "napcat:GroupMessage:999"
+
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.enable_natural_language_screen_assist = True
+        plugin.debug = False
+        plugin._allow_implicit_screen_skill_trigger = lambda event, text: False
+        plugin._extract_screen_assist_prompt = lambda text, allow_implicit: text
+        plugin._is_private_message_event = lambda event: False
+        plugin._is_group_message_event = lambda event: True
+        plugin._get_event_sender_id = lambda event: "999"
+        plugin._invoke_screen_skill = AsyncMock()
+
+        results = [
+            item
+            async for item in plugin.on_natural_language_screen_assist(FakeEvent())
+        ]
+
+        self.assertEqual([], results)
+        plugin._invoke_screen_skill.assert_not_called()
 
 
 class SharedActivityExtensionTests(unittest.TestCase):
