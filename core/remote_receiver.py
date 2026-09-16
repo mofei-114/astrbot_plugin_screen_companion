@@ -836,6 +836,12 @@ class RemoteScreenReceiver:
 
         msg_type = str(data.get("type", "") or "")
 
+        if not msg_type and "token" in data and not self.auth_token:
+            # 客户端无法在连接前知道服务端是否启用了认证。允许它在无认证服务端
+            # 仍发送已配置的令牌前言，并静默消费，避免该消息干扰随后的能力 ACK。
+            logger.debug("忽略无认证模式下多余的客户端令牌前言")
+            return
+
         if msg_type == "client_capabilities":
             await self._handle_client_capabilities(data, websocket)
             return
@@ -1230,6 +1236,7 @@ class RemoteScreenReceiver:
             return
         reply: dict[str, Any] = {
             "status": "video_chunk_received",
+            "upload_id": upload_id,
             "index": chunk_index,
         }
         async with self._lock:

@@ -867,6 +867,7 @@ class RemoteReceiverCacheCompatTests(unittest.IsolatedAsyncioTestCase):
 
         legacy_receiver = SimpleNamespace(
             has_request_capable_client=False,
+            has_authenticated_client=True,
             get_latest_screenshot=AsyncMock(
                 return_value=(JPEG, "Legacy", {"protocol_version": 1})
             ),
@@ -892,6 +893,22 @@ class RemoteReceiverCacheCompatTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RemoteScreenshotError) as ctx:
             await plugin._capture_screen_bytes()
         self.assertEqual("stale_cache", ctx.exception.code)
+
+    async def test_r19b_force_capture_without_client_reports_no_client(self) -> None:
+        receiver = RemoteScreenReceiver()
+        plugin = ScreenCompanionMediaMixin()
+        plugin.remote_mode = True
+        plugin.remote_screenshot_max_age = 60
+        plugin._remote_receiver = receiver
+        plugin._get_runtime_flag = lambda name, default=False: bool(
+            getattr(plugin, name, default)
+        )
+        plugin._get_capture_context_timeout = lambda media_kind=None: 20.0
+
+        with self.assertRaises(RemoteScreenshotError) as ctx:
+            await plugin._capture_screen_bytes(force_fresh_capture=True)
+
+        self.assertEqual("no_client", ctx.exception.code)
 
     async def test_r20_v2_cache_is_not_reusable_as_legacy_push(self) -> None:
         receiver = RemoteScreenReceiver()

@@ -513,6 +513,26 @@ class ClientCaptureTests(_BaseClientTest):
         finally:
             await harness.stop()
 
+    async def test_c05b_request_budget_includes_upload_ack_wait(self) -> None:
+        harness = await SessionHarness(
+            _make_config(request_budget=0.25, ack_timeout=5.0), auto_ack=False
+        ).start()
+        capture = _SyncCapture()
+        try:
+            with patch.object(remote_client, "capture_screenshot_context", capture):
+                started_at = time.monotonic()
+                await harness.socket.push(
+                    {"type": "request_screenshot", "request_id": "req-budget"}
+                )
+                await _wait_for(lambda: "screenshot_meta" in harness.socket.types())
+                await asyncio.wait_for(harness.runner, timeout=1.5)
+
+            self.assertTrue(harness.socket.closed)
+            self.assertLess(time.monotonic() - started_at, 1.0)
+            self.assertEqual([], harness.socket.binary_sent())
+        finally:
+            await harness.stop()
+
     async def test_c06_busy_control_message_is_not_blocked_by_pending_ack(self) -> None:
         harness = await SessionHarness(_make_config(), auto_ack=False).start()
         blocking = _BlockingCapture()
@@ -991,6 +1011,50 @@ class ClientVideoTests(_BaseClientTest):
                     {"type": "request_screenshot", "request_id": "req-end"}
                 )
                 await _wait_for(lambda: len(capture.calls) == 1, timeout=3.0)
+        finally:
+            await session._close_session()
+            session_task.cancel()
+            await asyncio.gather(session_task, return_exceptions=True)
+
+    async def test_video_ack_requires_matching_upload_id(self) -> None:
+        socket = FakeServerSocket()
+        session = RemoteClientSession(
+            socket, _make_config(), server_handshake=socket.handshake
+        )
+        session_task = asyncio.ensure_future(session.run())
+        try:
+            await _wait_for(
+                lambda: "client_capabilities" in socket.types(), timeout=3.0
+            )
+            await socket.push({"status": "capabilities_received"})
+            await _wait_for(lambda: session.negotiated, timeout=3.0)
+
+            video_task = asyncio.ensure_future(session._send_video(b"video"))
+            await _wait_for(lambda: socket.of_type("video_meta"), timeout=3.0)
+            upload_id = socket.of_type("video_meta")[0]["upload_id"]
+
+            await socket.push({"status": "video_ready", "upload_id": "wrong"})
+            await asyncio.sleep(0.1)
+            self.assertEqual([], socket.of_type("video_chunk"))
+
+            await socket.push({"status": "video_ready", "upload_id": upload_id})
+            await _wait_for(lambda: socket.of_type("video_chunk"), timeout=3.0)
+            await socket.push({
+                "status": "video_chunk_received",
+                "upload_id": "wrong",
+                "index": 0,
+            })
+            await asyncio.sleep(0.1)
+            self.assertEqual([], socket.of_type("video_complete"))
+
+            await socket.push({
+                "status": "video_chunk_received",
+                "upload_id": upload_id,
+                "index": 0,
+            })
+            await _wait_for(lambda: socket.of_type("video_complete"), timeout=3.0)
+            await socket.push({"status": "video_complete", "upload_id": upload_id})
+            await asyncio.wait_for(video_task, timeout=3.0)
         finally:
             await session._close_session()
             session_task.cancel()

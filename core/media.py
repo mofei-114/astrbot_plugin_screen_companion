@@ -3514,6 +3514,11 @@ class ScreenCompanionMediaMixin:
                 return image_bytes, window_title or "远程客户端截图"
 
             if force_fresh_capture:
+                if not receiver.has_authenticated_client:
+                    raise make_screenshot_error(
+                        "no_client",
+                        detail="当前没有已认证的远程客户端，无法完成强制重拍",
+                    )
                 raise make_screenshot_error(
                     "unsupported_client",
                     detail="客户端未声明按需截图能力，无法完成强制重拍",
