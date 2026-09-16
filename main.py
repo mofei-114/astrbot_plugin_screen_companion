@@ -2144,15 +2144,29 @@ class ScreenCompanion(ScreenCompanionProactiveMixin, ScreenCompanionRuntimeMixin
         try:
             duration = self._get_recording_duration_seconds()
             capture_timeout = self._get_capture_context_timeout("video")
-            yield event.plain_result(
-                f"\u5f00\u59cb\u5f55\u5236\u6700\u8fd1 {duration} \u79d2\u684c\u9762\u753b\u9762\u4e86\u3002\n"
-                "\u5f55\u5236\u5b8c\u6210\u540e\u6211\u4f1a\u7ee7\u7eed\u5206\u6790\u5185\u5bb9\uff0c\u6574\u4e2a\u8fc7\u7a0b\u4f1a\u6bd4 /kp \u6162\u4e00\u4e9b\u3002"
-            )
+            remote_mode = self._get_runtime_flag("remote_mode")
+            if remote_mode:
+                # 远程模式没有按需录屏能力，只能分析客户端最近上传的短片，
+                # 因此不能提示"正在录制"，否则用户会以为这是现拍画面。
+                yield event.plain_result(
+                    "远程模式下无法命令客户端立刻补录一段。\n"
+                    "我会分析客户端最近上传的录屏；如果需要更实时的画面，"
+                    "请改用 /kp 截图识别，或让客户端加 --video 持续上传。"
+                )
+            else:
+                yield event.plain_result(
+                    f"\u5f00\u59cb\u5f55\u5236\u6700\u8fd1 {duration} \u79d2\u684c\u9762\u753b\u9762\u4e86\u3002\n"
+                    "\u5f55\u5236\u5b8c\u6210\u540e\u6211\u4f1a\u7ee7\u7eed\u5206\u6790\u5185\u5bb9\uff0c\u6574\u4e2a\u8fc7\u7a0b\u4f1a\u6bd4 /kp \u6162\u4e00\u4e9b\u3002"
+                )
             capture_context = await asyncio.wait_for(
-                self._capture_one_shot_recording_context(duration),
+                self._capture_command_recording_context(),
                 timeout=capture_timeout,
             )
-            yield event.plain_result("\u5f55\u5236\u5b8c\u6210\uff0c\u6b63\u5728\u5206\u6790\u753b\u9762\u5185\u5bb9...")
+            yield event.plain_result(
+                "已取到远程客户端最近上传的录屏，正在分析画面内容..."
+                if remote_mode
+                else "\u5f55\u5236\u5b8c\u6210\uff0c\u6b63\u5728\u5206\u6790\u753b\u9762\u5185\u5bb9..."
+            )
 
             screen_result = await self._run_screen_assist(
                 event,

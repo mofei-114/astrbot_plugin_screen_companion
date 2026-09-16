@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -737,6 +738,243 @@ class ReceiverReadOnlyAccessorTests(unittest.TestCase):
 
         self.assertEqual("", receiver.latest_window_title)
         self.assertEqual({}, receiver.latest_system_stats)
+
+
+class RemoteLocalOnlyCollectorGuardTests(unittest.TestCase):
+    """远程模式下不得采集服务器本机的键鼠、麦克风与浏览器历史。"""
+
+    @staticmethod
+    def _make_plugin(**flags):
+        """构造一个具备运行时状态字段的真实插件实例（不跑 Star 初始化）。"""
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.learning_storage = tempfile.mkdtemp(prefix="sc_test_")
+        plugin.enable_input_stats = False
+        plugin.enable_mic_monitor = False
+        plugin.running = True
+        for name, value in flags.items():
+            setattr(plugin, name, value)
+        plugin._ensure_input_stats_state()
+        return plugin
+
+    def test_input_stats_listener_disabled_in_remote_mode(self) -> None:
+        plugin = self._make_plugin(remote_mode=True, enable_input_stats=True)
+
+        # 注入一个一被构造就报错的 pynput 替身：远程分支一旦触碰键盘监听即失败。
+        constructed: list = []
+
+        def _listener(**_kwargs):
+            constructed.append(True)
+            return SimpleNamespace(start=lambda: None, stop=lambda: None)
+
+        with patch.dict(
+            "sys.modules",
+            {"pynput": SimpleNamespace(keyboard=SimpleNamespace(Listener=_listener))},
+        ):
+            started = plugin._ensure_input_stats_listener()
+
+        self.assertFalse(started)
+        self.assertEqual([], constructed)
+        self.assertEqual("remote_unsupported", plugin._input_stats_status)
+        self.assertIn("远程模式", plugin._input_stats_status_detail)
+
+    def test_input_stats_listener_still_starts_in_local_mode(self) -> None:
+        """本地模式不因本次改动而改变：仍会尝试启动监听。"""
+        plugin = self._make_plugin(remote_mode=False, enable_input_stats=True)
+
+        fake_listener = SimpleNamespace(start=lambda: None, stop=lambda: None)
+        with patch.dict(
+            "sys.modules",
+            {
+                "pynput": SimpleNamespace(
+                    keyboard=SimpleNamespace(Listener=lambda **_: fake_listener)
+                )
+            },
+        ):
+            started = plugin._ensure_input_stats_listener()
+
+        self.assertTrue(started)
+        self.assertEqual("running", plugin._input_stats_status)
+
+    def test_browser_history_candidates_empty_in_remote_mode(self) -> None:
+        plugin = self._make_plugin(remote_mode=True)
+
+        with patch.dict("os.environ", {"LOCALAPPDATA": r"C:\Users\tester\AppData\Local"}):
+            candidates = plugin._get_local_browser_history_candidates()
+
+        self.assertEqual([], candidates)
+
+    def test_browser_history_candidates_not_forced_empty_in_local_mode(self) -> None:
+        """本地模式不做远程拦截：候选列表由本机目录是否存在决定。"""
+        plugin = self._make_plugin(remote_mode=False)
+
+        with patch.dict("os.environ", {"LOCALAPPDATA": r"C:\definitely\missing\path"}):
+            candidates = plugin._get_local_browser_history_candidates()
+
+        self.assertEqual([], candidates)
+
+    def test_mic_monitor_not_started_in_remote_mode(self) -> None:
+        plugin = self._make_plugin(remote_mode=True, enable_mic_monitor=True)
+
+        with patch.object(plugin, "_safe_create_task") as create_mock:
+            plugin._ensure_mic_monitor_background_task()
+
+        create_mock.assert_not_called()
+        self.assertIsNone(getattr(plugin, "_mic_monitor_background_task", None))
+
+
+class RemoteActivityFrameStalenessTests(unittest.TestCase):
+    """远程活动轨迹不得用过期帧无限延长同一条活动。"""
+
+    @staticmethod
+    def _make_plugin(age: float, *, max_age: int = 60, remote_mode: bool = True):
+        receiver = _FakeRemoteReceiver()
+        receiver.latest_age_seconds = age
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.remote_mode = remote_mode
+        plugin._remote_receiver = receiver
+        plugin.remote_screenshot_max_age = max_age
+        return plugin
+
+    def test_fresh_frame_is_not_stale(self) -> None:
+        self.assertFalse(self._make_plugin(5.0)._remote_activity_frame_is_stale())
+
+    def test_expired_frame_is_stale(self) -> None:
+        self.assertTrue(self._make_plugin(600.0)._remote_activity_frame_is_stale())
+
+    def test_missing_receiver_is_treated_as_stale(self) -> None:
+        plugin = self._make_plugin(1.0)
+        plugin._remote_receiver = None
+
+        self.assertTrue(plugin._remote_activity_frame_is_stale())
+
+    def test_infinite_and_nan_age_are_stale(self) -> None:
+        self.assertTrue(
+            self._make_plugin(float("inf"))._remote_activity_frame_is_stale()
+        )
+        self.assertTrue(
+            self._make_plugin(float("nan"))._remote_activity_frame_is_stale()
+        )
+
+    def test_runtime_status_exposes_remote_staleness(self) -> None:
+        plugin = self._make_plugin(600.0)
+        plugin.enable_background_activity_tracking = True
+        plugin.background_activity_tracking_interval = 15
+
+        status = plugin._get_background_activity_tracking_runtime_status()
+
+        self.assertTrue(status["remote_mode"])
+        self.assertTrue(status["remote_frame_stale"])
+
+    def test_runtime_status_marks_local_mode_as_not_remote(self) -> None:
+        plugin = self._make_plugin(600.0, remote_mode=False)
+        plugin.enable_background_activity_tracking = True
+        plugin.background_activity_tracking_interval = 15
+
+        status = plugin._get_background_activity_tracking_runtime_status()
+
+        self.assertFalse(status["remote_mode"])
+        self.assertFalse(status["remote_frame_stale"])
+
+
+class RemoteRecordingEntryTests(unittest.IsolatedAsyncioTestCase):
+    """手动录屏入口在远程模式下必须复用已上传录屏并如实标注来源。"""
+
+    def _make_plugin(self, *, remote_mode: bool):
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.remote_mode = remote_mode
+        return plugin
+
+    async def test_remote_mode_reuses_uploaded_recording_and_labels_it(self) -> None:
+        plugin = self._make_plugin(remote_mode=True)
+        cached_calls: list = []
+        one_shot_calls: list = []
+
+        async def cached():
+            cached_calls.append(True)
+            return {
+                "media_kind": "video",
+                "media_bytes": b"video",
+                "active_window_title": "Editor",
+            }
+
+        async def one_shot(_duration=None):
+            one_shot_calls.append(True)
+            return {"media_kind": "video", "media_bytes": b"fresh"}
+
+        plugin._capture_recording_context = cached
+        plugin._capture_one_shot_recording_context = one_shot
+
+        context = await plugin._capture_command_recording_context()
+
+        self.assertEqual([True], cached_calls)
+        self.assertEqual([], one_shot_calls)
+        self.assertTrue(context["remote_cached_recording"])
+        self.assertIn("远程客户端最近上传的录屏", context["source_label"])
+        self.assertIn("Editor", context["source_label"])
+
+    async def test_local_mode_still_records_a_fresh_clip(self) -> None:
+        plugin = self._make_plugin(remote_mode=False)
+        one_shot_calls: list = []
+
+        async def one_shot(duration=None):
+            one_shot_calls.append(duration)
+            return {"media_kind": "video", "media_bytes": b"fresh"}
+
+        async def cached():  # pragma: no cover - 本地模式不应走到这里
+            raise AssertionError("本地模式不应读取远程录屏缓存")
+
+        plugin._capture_recording_context = cached
+        plugin._capture_one_shot_recording_context = one_shot
+        plugin._get_recording_duration_seconds = lambda: 10
+
+        context = await plugin._capture_command_recording_context()
+
+        self.assertEqual([10], one_shot_calls)
+        self.assertNotIn("remote_cached_recording", context)
+
+    async def test_remote_kpr_does_not_claim_it_is_recording_now(self) -> None:
+        """/kpr 在远程模式不得提示"正在录制"，否则用户会以为画面是现拍的。"""
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.remote_mode = True
+        plugin.debug = False
+        plugin.running = True
+        plugin._split_message = lambda text: [text]
+        plugin._get_recording_duration_seconds = lambda: 10
+        plugin._get_capture_context_timeout = lambda _kind=None: 60.0
+        plugin._get_screen_analysis_timeout = lambda _kind=None: 120.0
+        # /kpr 带 @admin_required，直接调用装饰器需要权限钩子。
+        plugin._ensure_admin_permission = AsyncMock(return_value=True)
+        # 环境检查要求远程接收服务正在运行，否则会在发消息前提前返回。
+        running_receiver = _FakeRemoteReceiver()
+        running_receiver.is_running = True
+        plugin._remote_receiver = running_receiver
+
+        async def command_recording():
+            return {
+                "media_kind": "video",
+                "media_bytes": b"video",
+                "source_label": "Editor（远程客户端最近上传的录屏）",
+            }
+
+        plugin._capture_command_recording_context = command_recording
+        plugin._run_screen_assist = AsyncMock(return_value="看到了编辑器")
+
+        replies: list = []
+
+        class FakeEvent:
+            unified_msg_origin = "napcat:FriendMessage:10001"
+
+            def plain_result(self, text):
+                replies.append(text)
+                return text
+
+        results = [item async for item in plugin.kpr(FakeEvent())]
+        joined = "\n".join(str(item) for item in results)
+
+        self.assertNotIn("开始录制", joined)
+        self.assertIn("无法命令客户端立刻补录", joined)
+        self.assertIn("最近上传的录屏", joined)
+        plugin._run_screen_assist.assert_awaited_once()
 
 
 if __name__ == "__main__":

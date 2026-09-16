@@ -1946,6 +1946,15 @@ class ScreenCompanionMediaMixin:
             return
         if not self.enable_mic_monitor or not self.running:
             return
+        if self._get_runtime_flag("remote_mode"):
+            # 远程模式下用户麦克风在另一台机器上，服务器监听自身麦克风既不会
+            # 被用户说话触发，也会把服务器环境音混进触发链路。客户端尚未上报
+            # 音量，这里明确不启动监听任务。
+            logger.warning(
+                "远程模式下不会启动本机麦克风监听：客户端尚未上报麦克风音量，"
+                "「麦克风音量触发识屏」在远程模式暂不可用，请改用自动观察或手动识屏。"
+            )
+            return
         task = self._safe_create_task(self._mic_monitor_task(), name="mic_monitor")
         self._mic_monitor_background_task = task
         if task not in self.background_tasks:
@@ -2959,8 +2968,12 @@ class ScreenCompanionMediaMixin:
             except ImportError:
                 missing_libs.append("pygetwindow")
 
-        # 检查麦克风监控依赖
-        if check_mic and self.enable_mic_monitor:
+        # 检查麦克风监控依赖（远程模式下监听在用户机器上，不检查服务器依赖）
+        if (
+            check_mic
+            and self.enable_mic_monitor
+            and not self._get_runtime_flag("remote_mode")
+        ):
             missing_libs.extend(self._get_missing_mic_dependencies())
 
         if missing_libs:
@@ -3881,6 +3894,28 @@ class ScreenCompanionMediaMixin:
             except OSError:
                 pass
 
+    async def _capture_command_recording_context(self) -> dict[str, Any]:
+        """`/kpr` 等手动录屏入口的采集上下文。
+
+        远程模式不提供按需录屏：客户端只能按 ``--video`` 周期上传短片，
+        服务端无法命令它立刻补录一段。因此这里复用最近一次已上传的录屏，
+        并把它标注为"最近一段"而不是"刚刚录制"，避免把旧素材说成现拍画面。
+        本地模式行为不变，仍然即时录制一段新短片。
+        """
+        if self._get_runtime_flag("remote_mode"):
+            context = await self._capture_recording_context()
+            window_title = str(context.get("active_window_title", "") or "")
+            context["source_label"] = (
+                f"{window_title}（远程客户端最近上传的录屏）"
+                if window_title
+                else "远程客户端最近上传的录屏"
+            )
+            context["remote_cached_recording"] = True
+            return context
+        return await self._capture_one_shot_recording_context(
+            self._get_recording_duration_seconds()
+        )
+
     async def _capture_recognition_context(
         self,
         *,
@@ -3908,7 +3943,8 @@ class ScreenCompanionMediaMixin:
         if self._get_runtime_flag("remote_mode"):
             if self._use_screen_recording_mode():
                 return await self._capture_recording_context()
-            return await self._capture_screenshot_context()
+            # 主动观察同样需要"这一刻"的画面，显式要求新帧而不是依赖实现巧合。
+            return await self._capture_screenshot_context(force_fresh_capture=True)
         if self._use_screen_recording_mode():
             return await self._capture_one_shot_recording_context(
                 self._get_recording_duration_seconds()
