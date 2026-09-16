@@ -1009,5 +1009,47 @@ class RemoteAutoScreenLoadSourceTests(unittest.TestCase):
         self.assertIsNone(plugin._get_remote_system_status_prompt())
 
 
+class RemoteOpenWindowListTests(unittest.TestCase):
+    """远程模式下窗口列表不得来自服务器桌面。"""
+
+    def test_remote_mode_returns_empty_without_touching_pygetwindow(self) -> None:
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.remote_mode = True
+
+        # 注入一被调用就报错的替身：远程分支一旦读取本机窗口列表即失败。
+        def _boom(*_args, **_kwargs):
+            raise AssertionError("远程模式不应读取本机窗口列表")
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "pygetwindow": SimpleNamespace(
+                    getAllTitles=_boom, getAllWindows=_boom
+                )
+            },
+        ):
+            titles = plugin._list_open_window_titles()
+
+        self.assertEqual([], titles)
+
+    def test_local_mode_still_reads_window_titles(self) -> None:
+        """本地模式行为保持不变：仍会读取并去重本机窗口标题。"""
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.remote_mode = False
+        plugin._normalize_window_title = lambda text: str(text or "").strip()
+
+        with patch.dict(
+            "sys.modules",
+            {
+                "pygetwindow": SimpleNamespace(
+                    getAllTitles=lambda: ["Editor", "Editor", "  ", "Browser"]
+                )
+            },
+        ):
+            titles = plugin._list_open_window_titles()
+
+        self.assertEqual(["Editor", "Browser"], titles)
+
+
 if __name__ == "__main__":
     unittest.main()
