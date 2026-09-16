@@ -247,6 +247,30 @@ class RemoteScreenReceiver:
         return int(self._latest_protocol_version or 0)
 
     @property
+    def latest_window_title(self) -> str:
+        """最近一次完整帧的窗口标题；没有可用帧时返回空字符串。
+
+        只读探测，不发送网络请求。远程模式下这是活动窗口信息的唯一可信来源，
+        调用方不得在它为空时回落到服务器本机的窗口查询。
+        """
+        if not self.has_screenshot:
+            return ""
+        return str(self._latest_window_title or "")
+
+    @property
+    def latest_system_stats(self) -> dict[str, Any]:
+        """最近一次完整帧随帧上报的客户端系统统计。
+
+        只读探测，不发送网络请求。按需截图默认不采样统计，因此正常情况可能是
+        空字典；调用方必须把「没有数据」当作不产生提示，而不是回落到服务器
+        本机的 psutil 采样。
+        """
+        if not self.has_screenshot:
+            return {}
+        stats = self._latest_meta.get("system_stats")
+        return dict(stats) if isinstance(stats, dict) else {}
+
+    @property
     def has_request_capable_client(self) -> bool:
         """是否存在声明了按需截图能力的已认证连接（只读探测，不发送消息）。"""
         if self._stopping:

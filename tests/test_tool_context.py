@@ -507,5 +507,237 @@ class WorkCollaborationContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({}, result["observation"])
 
 
+class _FakeRemoteReceiver:
+    """接收器替身：只暴露本次改造用到的只读探测属性。"""
+
+    def __init__(
+        self,
+        *,
+        system_stats: dict | None = None,
+        window_title: str = "",
+        has_screenshot: bool = True,
+    ) -> None:
+        self.latest_system_stats = dict(system_stats or {})
+        self.latest_window_title = window_title
+        self.has_screenshot = has_screenshot
+
+
+def _make_remote_media_plugin(receiver):
+    """构造一个只带远程分支所需字段的真实插件实例（不跑 Star 初始化）。"""
+    plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+    plugin.remote_mode = True
+    plugin._remote_receiver = receiver
+    plugin.battery_threshold = 20
+    plugin.memory_threshold = 80
+    return plugin
+
+
+class RemoteSystemStatusPromptTests(unittest.TestCase):
+    """远程系统状态必须来自客户端统计，且缺失时不得回落服务器本机采样。"""
+
+    def test_remote_stats_drive_high_load_prompt(self) -> None:
+        plugin = _make_remote_media_plugin(
+            _FakeRemoteReceiver(system_stats={"cpu_percent": 95, "memory_percent": 30})
+        )
+
+        prompt, high_load = plugin._get_system_status_prompt()
+
+        self.assertTrue(high_load)
+        self.assertIn("当前系统负载较高", prompt)
+
+    def test_remote_low_battery_prompt(self) -> None:
+        plugin = _make_remote_media_plugin(
+            _FakeRemoteReceiver(
+                system_stats={"cpu_percent": 5, "memory_percent": 20, "battery_percent": 8}
+            )
+        )
+
+        prompt, high_load = plugin._get_system_status_prompt()
+
+        self.assertFalse(high_load)
+        self.assertIn("当前设备电量偏低", prompt)
+
+    def test_remote_without_stats_does_not_fall_back_to_local_psutil(self) -> None:
+        """按需截图默认不采样统计；此时必须完全不产生提示。"""
+        plugin = _make_remote_media_plugin(_FakeRemoteReceiver(system_stats={}))
+
+        with patch("psutil.cpu_percent") as cpu_mock:
+            prompt, high_load = plugin._get_system_status_prompt()
+
+        self.assertEqual("", prompt)
+        self.assertFalse(high_load)
+        cpu_mock.assert_not_called()
+
+    def test_remote_without_receiver_does_not_probe_local_machine(self) -> None:
+        plugin = _make_remote_media_plugin(None)
+
+        with patch("psutil.cpu_percent") as cpu_mock:
+            prompt, high_load = plugin._get_system_status_prompt()
+
+        self.assertEqual("", prompt)
+        self.assertFalse(high_load)
+        cpu_mock.assert_not_called()
+
+    def test_invalid_remote_stat_values_are_ignored(self) -> None:
+        """缺字段、非数值和越界值都不能被当作可信数据。"""
+        plugin = _make_remote_media_plugin(
+            _FakeRemoteReceiver(
+                system_stats={
+                    "cpu_percent": "not-a-number",
+                    "memory_percent": None,
+                    "battery_percent": 500,
+                }
+            )
+        )
+
+        prompt, high_load = plugin._get_system_status_prompt()
+
+        self.assertEqual("", prompt)
+        self.assertFalse(high_load)
+
+    def test_coerce_stat_percent_bounds(self) -> None:
+        from astrbot_plugin_screen_companion.core.media import (
+            ScreenCompanionMediaMixin,
+        )
+
+        coerce = ScreenCompanionMediaMixin._coerce_stat_percent
+
+        self.assertEqual(42.5, coerce(42.5))
+        self.assertEqual(0.0, coerce(0))
+        self.assertEqual(100.0, coerce(100))
+        self.assertIsNone(coerce(None))
+        self.assertIsNone(coerce(True))
+        self.assertIsNone(coerce("abc"))
+        self.assertIsNone(coerce(-1))
+        self.assertIsNone(coerce(101))
+        self.assertIsNone(coerce(float("nan")))
+        self.assertIsNone(coerce(float("inf")))
+
+
+class RemoteActiveWindowSourceTests(unittest.TestCase):
+    """远程活动窗口必须来自客户端帧，且不得读取服务器本机窗口。"""
+
+    @staticmethod
+    def _make_runtime_plugin(receiver, *, remote_mode: bool = True):
+        plugin = main.ScreenCompanion.__new__(main.ScreenCompanion)
+        plugin.remote_mode = remote_mode
+        plugin._remote_receiver = receiver
+        return plugin
+
+    @staticmethod
+    def _forbid_local_window_api():
+        """注入一个一被访问就报错的 pygetwindow，用于证明本机窗口未被读取。
+
+        宿主机通常没有安装 pygetwindow，因此不能直接 patch 属性；
+        这里显式注入替身，远程分支一旦触碰本机窗口查询就会立刻失败。
+        """
+        calls: list = []
+        fake = SimpleNamespace(
+            getActiveWindow=lambda: calls.append(True) or None,
+        )
+        return patch.dict("sys.modules", {"pygetwindow": fake}), calls
+
+    def test_remote_mode_returns_client_window_title(self) -> None:
+        plugin = self._make_runtime_plugin(
+            _FakeRemoteReceiver(window_title="Visual Studio Code")
+        )
+
+        patcher, calls = self._forbid_local_window_api()
+        with patcher:
+            title, region = plugin._get_active_window_info()
+
+        self.assertEqual("Visual Studio Code", title)
+        self.assertIsNone(region)
+        self.assertEqual([], calls)
+
+    def test_remote_mode_without_frame_returns_empty_without_local_probe(self) -> None:
+        plugin = self._make_runtime_plugin(
+            _FakeRemoteReceiver(window_title="", has_screenshot=False)
+        )
+
+        patcher, calls = self._forbid_local_window_api()
+        with patcher:
+            title, region = plugin._get_active_window_info()
+
+        self.assertEqual("", title)
+        self.assertIsNone(region)
+        self.assertEqual([], calls)
+
+    def test_remote_mode_without_receiver_returns_empty(self) -> None:
+        plugin = self._make_runtime_plugin(None)
+
+        title, region = plugin._get_active_window_info()
+
+        self.assertEqual("", title)
+        self.assertIsNone(region)
+
+    def test_local_mode_still_uses_local_window(self) -> None:
+        """本地模式行为保持不变：依然读取本机窗口，不使用远程帧。"""
+        plugin = self._make_runtime_plugin(
+            _FakeRemoteReceiver(window_title="Remote Window"),
+            remote_mode=False,
+        )
+        local_window = SimpleNamespace(
+            title="Local Editor",
+            left=10,
+            top=20,
+            width=800,
+            height=600,
+        )
+
+        with (
+            patch.dict(
+                "sys.modules",
+                {"pygetwindow": SimpleNamespace(getActiveWindow=lambda: local_window)},
+            ),
+            patch("sys.platform", "win32"),
+        ):
+            title, region = plugin._get_active_window_info()
+
+        self.assertEqual("Local Editor", title)
+        self.assertEqual((10, 20, 800, 600), region)
+        self.assertNotEqual("Remote Window", title)
+
+
+class ReceiverReadOnlyAccessorTests(unittest.TestCase):
+    """接收器的只读探测不得触发采集。"""
+
+    @staticmethod
+    def _make_receiver(*, image: bytes, title: str, stats: dict | None):
+        from astrbot_plugin_screen_companion.core.remote_receiver import (
+            RemoteScreenReceiver,
+        )
+
+        receiver = RemoteScreenReceiver(auth_token="test-token")
+        receiver._latest_image_bytes = image
+        receiver._latest_window_title = title
+        receiver._latest_timestamp = 1.0
+        receiver._latest_meta = {"system_stats": dict(stats or {})}
+        return receiver
+
+    def test_accessors_expose_committed_frame(self) -> None:
+        receiver = self._make_receiver(
+            image=b"\xff\xd8\xff\xe0jpeg",
+            title="Editor",
+            stats={"cpu_percent": 12},
+        )
+
+        self.assertEqual("Editor", receiver.latest_window_title)
+        self.assertEqual({"cpu_percent": 12}, receiver.latest_system_stats)
+
+    def test_accessors_return_empty_without_frame(self) -> None:
+        receiver = self._make_receiver(image=b"", title="Editor", stats={"cpu_percent": 12})
+
+        self.assertEqual("", receiver.latest_window_title)
+        self.assertEqual({}, receiver.latest_system_stats)
+
+    def test_accessors_return_empty_for_non_dict_stats(self) -> None:
+        receiver = self._make_receiver(image=b"\xff\xd8jpeg", title="", stats=None)
+        receiver._latest_meta = {"system_stats": "broken"}
+
+        self.assertEqual("", receiver.latest_window_title)
+        self.assertEqual({}, receiver.latest_system_stats)
+
+
 if __name__ == "__main__":
     unittest.main()

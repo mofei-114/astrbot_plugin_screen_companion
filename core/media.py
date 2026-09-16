@@ -5131,8 +5131,89 @@ class ScreenCompanionMediaMixin:
             return holiday_prompt
         return ""
 
+    @staticmethod
+    def _coerce_stat_percent(value: Any) -> float | None:
+        """把系统统计里的一个百分比字段收敛为 0~100 的浮点数。
+
+        缺字段、非数值、NaN 和越界值一律返回 ``None``，表示"这项没有可信数据"。
+        远程客户端可能因为平台差异少报字段，不能用默认值把缺失伪装成 0。
+        """
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            percent = float(value)
+        except (TypeError, ValueError):
+            return None
+        if percent != percent or percent in (float("inf"), float("-inf")):
+            return None
+        if percent < 0.0 or percent > 100.0:
+            return None
+        return percent
+
+    def _build_system_status_prompt(
+        self,
+        *,
+        cpu_percent: float | None,
+        memory_percent: float | None,
+        battery_percent: float | None,
+    ) -> tuple[str, bool]:
+        """按阈值把系统统计翻译成提示词；本地与远程分支共用同一套判定。
+
+        全部输入都可能为 ``None``（该平台没有这项统计）。没有任何可信数据时
+        必须返回空提示，不能编造状态，也不能改用其他来源的数据。
+        """
+        system_prompt = ""
+        system_high_load = False
+
+        battery_threshold = getattr(self, "battery_threshold", 20)
+        if battery_percent is not None and battery_percent < battery_threshold:
+            system_prompt += " 当前设备电量偏低，若建议涉及长时间操作，请顺手提醒保存进度。"
+
+        memory_threshold = getattr(self, "memory_threshold", 80)
+        cpu_high = cpu_percent is not None and cpu_percent > 80
+        memory_high = memory_percent is not None and memory_percent > memory_threshold
+        if cpu_high or memory_high:
+            if system_prompt:
+                system_prompt += " "
+            system_prompt += " 当前系统负载较高，请避免建议用户同时做太重的操作。"
+            system_high_load = True
+            logger.info(
+                f"系统资源使用过高: CPU={cpu_percent}, 内存={memory_percent}"
+            )
+        return system_prompt, system_high_load
+
+    def _get_remote_system_status_prompt(self) -> tuple[str, bool] | None:
+        """远程模式下的系统状态提示：只读客户端随帧上报的统计。
+
+        返回 ``None`` 表示当前没有可信的远程统计（客户端尚未上报、按需路径
+        默认不采样，或字段缺失）。调用方必须把它当作"不产生系统状态提示"，
+        绝不能回落到服务器本机的 psutil 采样——那会把服务器负载说成用户设备
+        状态。本方法只读缓存，不触发截图。
+        """
+        receiver = getattr(self, "_remote_receiver", None)
+        if receiver is None:
+            return None
+        stats = getattr(receiver, "latest_system_stats", None)
+        if not isinstance(stats, dict) or not stats:
+            return None
+        return self._build_system_status_prompt(
+            cpu_percent=self._coerce_stat_percent(stats.get("cpu_percent")),
+            memory_percent=self._coerce_stat_percent(stats.get("memory_percent")),
+            battery_percent=self._coerce_stat_percent(stats.get("battery_percent")),
+        )
+
     def _get_system_status_prompt(self) -> tuple:
-        """获取系统状态提示词。"""
+        """获取系统状态提示词。
+
+        远程模式下使用客户端上报的统计；没有可信数据时不产生提示，也不读取
+        服务器本机负载。本地模式行为与改造前保持一致。
+        """
+        if self._get_runtime_flag("remote_mode"):
+            remote_result = self._get_remote_system_status_prompt()
+            if remote_result is None:
+                return "", False
+            return remote_result
+
         system_prompt = ""
         system_high_load = False
         try:
@@ -5148,19 +5229,13 @@ class ScreenCompanionMediaMixin:
                     battery = psutil.sensors_battery()
                 except Exception as battery_error:
                     logger.debug(f"获取电池状态失败: {battery_error}")
-            battery_threshold = getattr(self, "battery_threshold", 20)
-            if battery and getattr(battery, "percent", None) is not None and battery.percent < battery_threshold:
-                system_prompt += " 当前设备电量偏低，若建议涉及长时间操作，请顺手提醒保存进度。"
+            battery_percent = getattr(battery, "percent", None) if battery else None
 
-            memory_threshold = getattr(self, "memory_threshold", 80)
-            if cpu_percent > 80 or memory_percent > memory_threshold:
-                if system_prompt:
-                    system_prompt += " "
-                system_prompt += " 当前系统负载较高，请避免建议用户同时做太重的操作。"
-                system_high_load = True
-                logger.info(
-                    f"系统资源使用过高: CPU={cpu_percent}%, 内存={memory_percent}%"
-                )
+            return self._build_system_status_prompt(
+                cpu_percent=self._coerce_stat_percent(cpu_percent),
+                memory_percent=self._coerce_stat_percent(memory_percent),
+                battery_percent=self._coerce_stat_percent(battery_percent),
+            )
         except ImportError:
             logger.debug("Debug event")
         except Exception as e:
